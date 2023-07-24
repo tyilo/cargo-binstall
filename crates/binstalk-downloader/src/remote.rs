@@ -13,7 +13,6 @@ use reqwest::{
     Request,
 };
 use thiserror::Error as ThisError;
-use tower::{limit::rate::RateLimit, Service, ServiceBuilder, ServiceExt};
 use tracing::{debug, info};
 
 pub use reqwest::{header, Error as ReqwestError, Method, StatusCode};
@@ -73,7 +72,7 @@ impl HttpError {
 #[derive(Debug)]
 struct Inner {
     client: reqwest::Client,
-    service: DelayRequest<RateLimit<reqwest::Client>>,
+    service: DelayRequest,
 }
 
 #[derive(Clone, Debug)]
@@ -81,7 +80,10 @@ pub struct Client(Arc<Inner>);
 
 #[cfg_attr(not(feature = "__tls"), allow(unused_variables, unused_mut))]
 impl Client {
-    /// * `per` - must not be 0.
+    /// * `per` - must not be 0, could be increased if rate-limit
+    ///   happens.
+    ///   This can be no larger than 60s, it will get truncated
+    ///   to 60s if it is larger than that.
     /// * `num_request` - maximum number of requests to be processed for
     ///   each `per` duration.
     ///
@@ -122,11 +124,7 @@ impl Client {
 
             Ok(Client(Arc::new(Inner {
                 client: client.clone(),
-                service: DelayRequest::new(
-                    ServiceBuilder::new()
-                        .rate_limit(num_request.get(), per)
-                        .service(client),
-                ),
+                service: DelayRequest::new(num_request, per.min(Duration::from_secs(60)), client),
             })))
         }
 
@@ -159,9 +157,7 @@ impl Client {
         url: &Url,
     ) -> Result<ControlFlow<reqwest::Response, Result<reqwest::Response, ReqwestError>>, ReqwestError>
     {
-        let future = (&self.0.service).ready().await?.call(request);
-
-        let response = match future.await {
+        let response = match self.0.service.call(request).await {
             Err(err) if err.is_timeout() || err.is_connect() => {
                 let duration = RETRY_DURATION_FOR_TIMEOUT;
 
